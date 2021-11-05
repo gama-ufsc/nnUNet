@@ -13,20 +13,31 @@
 #    limitations under the License.
 
 
+from copy import deepcopy
+from multiprocessing import Queue, Process
+from threading import Thread
 from time import sleep
+from typing import Tuple, Union
+import matplotlib
+import matplotlib.pyplot as plt
 
+import nibabel as nib
 import numpy as np
+import SimpleITK as sitk
 import torch
+
 from batchgenerators.utilities.file_and_folder_operations import *
 from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
+from nnunet.configuration import default_num_threads
 from nnunet.evaluation.region_based_evaluation import evaluate_regions, get_brats_regions
 from nnunet.network_architecture.generic_UNet import Generic_UNet
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
+from nnunet.preprocessing.preprocessing import get_lowres_axis, get_do_separate_z, resample_data_or_seg
 from nnunet.training.dataloading.dataset_loading import unpack_dataset
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.training.loss_functions.dice_loss import DC_and_BCE_loss, get_tp_fp_fn_tn, SoftDiceLoss
@@ -34,6 +45,12 @@ from nnunet.training.network_training.nnUNetTrainerV2 import nnUNetTrainerV2
 from nnunet.training.network_training.nnUNetTrainerV2_DDP import nnUNetTrainerV2_DDP
 from nnunet.utilities.distributed import awesome_allgather_function
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
+
+import sys
+sys.path.append('/home/bruno-pacheco/brats/')
+from brats.utils import dice
+
+eval_every = 2
 
 
 class nnUNetTrainerV2BraTSRegions_BN(nnUNetTrainerV2):
@@ -63,6 +80,447 @@ class nnUNetTrainerV2BraTSRegions_BN(nnUNetTrainerV2):
         self.network.inference_apply_nonlin = torch.nn.Softmax(1)
 
 
+def postprocess_softmax_return_dice(segmentation_softmax: Union[str, np.ndarray],
+                                    properties_dict: dict, order: int = 1,
+                                    region_class_order: Tuple[Tuple[int]] = None,
+                                    force_separate_z: bool = None,
+                                    interpolation_order_z: int = 0,
+                                    gt_fpath: str = None):
+    """THIS IS A COPY OF `save_segmentation_nifti_from_softmax`.
+
+    I just stripped it of the saving part so it returns the pred image. And added dice calculation.
+    """
+    if isinstance(segmentation_softmax, str):
+        assert isfile(segmentation_softmax), "If isinstance(segmentation_softmax, str) then " \
+                                             "isfile(segmentation_softmax) must be True"
+        del_file = deepcopy(segmentation_softmax)
+        segmentation_softmax = np.load(segmentation_softmax)
+        os.remove(del_file)
+
+    # first resample, then put result into bbox of cropping, then save
+    current_shape = segmentation_softmax.shape
+    shape_original_after_cropping = properties_dict.get('size_after_cropping')
+    shape_original_before_cropping = properties_dict.get('original_size_of_raw_data')
+
+    if np.any([i != j for i, j in zip(np.array(current_shape[1:]), np.array(shape_original_after_cropping))]):
+        if force_separate_z is None:
+            if get_do_separate_z(properties_dict.get('original_spacing')):
+                do_separate_z = True
+                lowres_axis = get_lowres_axis(properties_dict.get('original_spacing'))
+            elif get_do_separate_z(properties_dict.get('spacing_after_resampling')):
+                do_separate_z = True
+                lowres_axis = get_lowres_axis(properties_dict.get('spacing_after_resampling'))
+            else:
+                do_separate_z = False
+                lowres_axis = None
+        else:
+            do_separate_z = force_separate_z
+            if do_separate_z:
+                lowres_axis = get_lowres_axis(properties_dict.get('original_spacing'))
+            else:
+                lowres_axis = None
+
+        seg_old_spacing = resample_data_or_seg(segmentation_softmax, shape_original_after_cropping, is_seg=False,
+                                               axis=lowres_axis, order=order, do_separate_z=do_separate_z, cval=0,
+                                               order_z=interpolation_order_z)
+    else:
+        seg_old_spacing = segmentation_softmax
+
+    if region_class_order is None:
+        seg_old_spacing = seg_old_spacing.argmax(0)
+    else:
+        seg_old_spacing_final = np.zeros(seg_old_spacing.shape[1:])
+        for i, c in enumerate(region_class_order):
+            seg_old_spacing_final[seg_old_spacing[i] > 0.5] = c
+        seg_old_spacing = seg_old_spacing_final
+
+    bbox = properties_dict.get('crop_bbox')
+
+    if bbox is not None:
+        seg_old_size = np.zeros(shape_original_before_cropping)
+        for c in range(3):
+            bbox[c][1] = np.min((bbox[c][0] + seg_old_spacing.shape[c], shape_original_before_cropping[c]))
+        seg_old_size[bbox[0][0]:bbox[0][1],
+        bbox[1][0]:bbox[1][1],
+        bbox[2][0]:bbox[2][1]] = seg_old_spacing
+    else:
+        seg_old_size = seg_old_spacing
+
+    seg_old_size_postprocessed = seg_old_size
+
+    seg_resized_itk = sitk.GetImageFromArray(seg_old_size_postprocessed.astype(np.uint8))
+    seg_resized_itk.SetSpacing(properties_dict['itk_spacing'])
+    seg_resized_itk.SetOrigin(properties_dict['itk_origin'])
+    seg_resized_itk.SetDirection(properties_dict['itk_direction'])
+
+    pred = sitk.GetArrayFromImage(seg_resized_itk).transpose()
+    label = nib.load(gt_fpath).get_fdata()
+
+    scores = list()
+    for c in range(1,3+1):
+        scores.append(dice(pred, label, c))
+
+    return scores
+
+
+class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
+    def update_eval_criterion_MA(self):
+        """
+        If self.all_val_eval_metrics is unused (len=0) then we fall back to using -self.all_val_losses for the MA to determine early stopping
+        (not a minimization, but a maximization of a metric and therefore the - in the latter case)
+
+        Modified to run only every `eval_every` epochs.
+        :return:
+        """
+        if self.epoch % eval_every == 0:
+            if self.val_eval_criterion_MA is None:
+                if len(self.all_val_eval_metrics) == 0:
+                    self.val_eval_criterion_MA = - self.all_val_losses[-1]
+                else:
+                    all_MAs = [self.all_val_eval_metrics[0]]
+                    for i in range(1, len(self.all_val_eval_metrics)):
+                        all_MAs.append(
+                            self.val_eval_criterion_alpha * all_MAs[i-1] +
+                            (1 - self.val_eval_criterion_alpha) * self.all_val_eval_metrics[i]
+                        )
+                    self.all_val_eval_criterion_MAs = all_MAs
+                    self.val_eval_criterion_MA = all_MAs[-1]
+            else:
+                if len(self.all_val_eval_metrics) == 0:
+                    """
+                    We here use alpha * old - (1 - alpha) * new because new in this case is the vlaidation loss and lower
+                    is better, so we need to negate it.
+                    """
+                    self.val_eval_criterion_MA = self.val_eval_criterion_alpha * self.val_eval_criterion_MA - (
+                            1 - self.val_eval_criterion_alpha) * \
+                                                self.all_val_losses[-1]
+                else:
+                    self.val_eval_criterion_MA = self.val_eval_criterion_alpha * self.val_eval_criterion_MA + (
+                            1 - self.val_eval_criterion_alpha) * \
+                                                self.all_val_eval_metrics[-1]
+                    self.all_val_eval_criterion_MAs.append(self.val_eval_criterion_MA)
+
+    def plot_progress(self):
+        """
+        Should probably be improved
+        :return:
+        """
+        try:
+            font = {'weight': 'normal',
+                    'size': 18}
+
+            matplotlib.rc('font', **font)
+
+            fig = plt.figure(figsize=(30, 24))
+            ax = fig.add_subplot(111)
+            ax2 = ax.twinx()
+
+            x_values = list(range(self.epoch + 1))
+
+            ax.plot(x_values, self.all_tr_losses, color='b', ls='-', label="loss_tr")
+
+            ax.plot(x_values, self.all_val_losses, color='r', ls='-', label="loss_val, train=False")
+
+            if len(self.all_val_losses_tr_mode) > 0:
+                ax.plot(x_values, self.all_val_losses_tr_mode, color='g', ls='-', label="loss_val, train=True")
+
+            x_values_eval = list(range(0, self.epoch + 1, eval_every))
+            if len(self.all_val_eval_metrics) == len(x_values_eval):
+                ax2.plot(x_values_eval, self.all_val_eval_metrics, color='g', ls='--', label="evaluation metric")
+                ax2.plot(x_values_eval, self.all_val_eval_criterion_MAs, color='g', label=f"(alpha={self.val_eval_criterion_alpha})")
+
+            ax.set_xlabel("epoch")
+            ax.set_ylabel("loss")
+            ax2.set_ylabel("evaluation metric")
+            ax.legend()
+            ax.grid()
+            ax2.legend(loc=9)
+
+            fig.savefig(join(self.output_folder, "progress.png"))
+            plt.close()
+        except IOError:
+            self.print_to_log_file("failed to plot: ", sys.exc_info())
+
+    def finish_online_evaluation(self):
+        # leaving this here just so I'm sure I won't mess up with anything
+        self.online_eval_foreground_dc = []
+        self.online_eval_tp = []
+        self.online_eval_fp = []
+        self.online_eval_fn = []
+
+        if self.epoch % eval_every == 0:
+            # from validate():
+            self.print_to_log_file("WARNING: the evaluation was modified to perform"
+                                " exactly as in the validation. This will take a while.")
+
+            # input args
+            do_mirroring = True
+            use_sliding_window = True
+            step_size = 0.5
+            save_softmax = False
+            use_gaussian = True
+            overwrite = True
+            all_in_gpu = False
+
+            ds = self.network.do_ds
+            self.network.do_ds = False
+            current_mode = self.network.training
+            self.network.eval()
+
+            assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+            if self.dataset_val is None:
+                self.load_dataset()
+                self.do_split()
+
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+
+            # predictions as they come from the network go here
+            output_folder = "/home/bruno-pacheco/brats-generalization/.tmpdir/"
+            maybe_mkdir_p(output_folder)
+
+            if do_mirroring:
+                if not self.data_aug_params['do_mirror']:
+                    raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+                mirror_axes = self.data_aug_params['mirror_axes']
+            else:
+                mirror_axes = ()
+
+            # export_pool = Pool(default_num_threads)
+            results = []
+
+            def load(ks_queue, data_queue):
+                try:
+                    while True:
+                        k = ks_queue.get()
+
+                        if k is None:
+                            ks_queue.put(None)
+                            break
+
+                        properties = load_pickle(self.dataset[k]['properties_file'])
+                        fname = properties['list_of_data_files'][0].split("/")[-1][:-12]
+
+                        data = np.load(self.dataset[k]['data_file'])['data']
+
+                        data[-1][data[-1] == -1] = 0
+
+                        q_size = data_queue.qsize()
+                        print(k, data.shape, self.dataset[k]['data_file'], q_size)
+
+                        data_queue.put((data[:-1], fname, properties))
+                except Exception as e:
+                    print('LOADER EXCEPTION:')
+                    print(e)
+                finally:
+                    data_queue.put(None)
+
+            def predict(data_queue, pred_queue):
+                while True:
+                    item = data_queue.get()
+
+                    if item is None:
+                        # propagate ending signal to other consumers
+                        data_queue.put(None)
+                        break
+                    else:
+                        data, fname, properties = item
+
+                    ret = self.predict_preprocessed_data_return_seg_and_softmax(
+                        # data[:-1],
+                        data,
+                        do_mirroring=do_mirroring,
+                        mirror_axes=mirror_axes,
+                        use_sliding_window=use_sliding_window,
+                        step_size=step_size,
+                        use_gaussian=use_gaussian,
+                        all_in_gpu=all_in_gpu,
+                        mixed_precision=self.fp16,
+                        verbose=False
+                    )
+
+                    softmax_pred = ret[1]
+
+                    softmax_pred = softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    """There is a problem with python process communication that prevents us from communicating obejcts
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (\%i I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    # if np.prod(softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                    #     np.save(join(output_folder, fname + ".npy"), softmax_pred)
+                    #     softmax_pred = join(output_folder, fname + ".npy")
+
+                    # results.append(export_pool.starmap_async(postprocess_softmax_return_dice,
+                    #                                         ((softmax_pred,
+                    #                                         properties, interpolation_order, self.regions_class_order,
+                    #                                         force_separate_z, interpolation_order_z,
+                    #                                         join(self.gt_niftis_folder, fname + ".nii.gz")),
+                    #                                         )
+                    #                                         )
+                    #             )
+                    # results.append(delayed(postprocess_softmax_return_dice)(
+                    #     softmax_pred, properties, interpolation_order,
+                    #     self.regions_class_order, force_separate_z,
+                    #     interpolation_order_z,
+                    #     join(self.gt_niftis_folder, fname + ".nii.gz"),
+                    # ))
+
+                    # yield (
+                    #     softmax_pred, properties, interpolation_order,
+                    #     self.regions_class_order, force_separate_z,
+                    #     interpolation_order_z,
+                    #     join(self.gt_niftis_folder, fname + ".nii.gz"),
+                    # )
+                    pred_queue.put((
+                        softmax_pred, properties, interpolation_order,
+                        self.regions_class_order, force_separate_z,
+                        interpolation_order_z,
+                        join(self.gt_niftis_folder, fname + ".nii.gz"),
+                    ))
+                pred_queue.put(None)
+
+            def compute_score(pred_queue, scores_queue):
+                try:
+                    while True:
+                        pred = pred_queue.get()
+
+                        if pred is None:
+                            # propagate ending signal to other consumers
+                            pred_queue.put(None)
+                            break
+
+                        print('consuming '+pred[-1])
+
+                        scores_queue.put(postprocess_softmax_return_dice(*pred))
+                except Exception as e:
+                    print('CONSUMER EXCEPTION:')
+                    print(e)
+
+            ks_queue = Queue()
+            data_queue = Queue(3)
+            pred_queue = Queue()
+            scores_queue = Queue()
+
+            # build queue with patient ids
+            for k in self.dataset_val.keys():
+                ks_queue.put(k)
+            ks_queue.put(None)
+
+            n_loader_threads = 2
+            print(f'firing {n_loader_threads} loaders')
+            # fire loaders
+            loaders = [Thread(target=load, args=(ks_queue, data_queue))
+                       for _ in range(n_loader_threads)]
+            for loader in loaders:
+                loader.daemon = True
+                loader.start()
+
+            print(f'firing {default_num_threads - n_loader_threads} consumers')
+            # fire consumers
+            # consumers = [Thread(target=compute_score, args=(pred_queue, scores_queue))
+            consumers = [Process(target=compute_score, args=(pred_queue, scores_queue))
+                         for _ in range(default_num_threads)]
+            for consumer in consumers:
+                consumer.daemon = True
+                consumer.start()
+
+            # run producer
+            predict(data_queue, pred_queue)
+
+            # wait for all consumers to finish
+            for consumer in consumers:
+                consumer.join()
+
+            # dump scores
+            print('dumping scores')
+            results = list()
+            while not scores_queue.empty():
+                results.append(scores_queue.get())
+
+            import psutil
+            for consumer in consumers:
+                print('Killing process with pid {}'.format(consumer.pid))
+                try:
+                    psutil.Process(consumer.pid).terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            # results = [i.get()[0] for i in results]
+            # results = Parallel(n_jobs=default_num_threads, backend="threading")(results)
+            # results = Parallel(n_jobs=default_num_threads, backend="threading")(
+            # results = Parallel(n_jobs=default_num_threads, backend="threading")(
+            #     delayed(postprocess_softmax_return_dice)(*d) for d in predict()
+            # )
+
+            dice_agg = np.median(np.mean(results, axis=1))
+
+            self.print_to_log_file("Dice over regions:", str(dice_agg))
+
+            self.all_val_eval_metrics.append(dice_agg)
+
+            self.network.train(current_mode)
+            self.network.do_ds = ds
+
+    def manage_patience(self):
+        # update patience
+        continue_training = True
+        if self.patience is not None:
+            # if best_MA_tr_loss_for_patience and best_epoch_based_on_MA_tr_loss were not yet initialized,
+            # initialize them
+            if self.best_MA_tr_loss_for_patience is None:
+                self.best_MA_tr_loss_for_patience = self.train_loss_MA
+
+            if self.best_epoch_based_on_MA_tr_loss is None:
+                self.best_epoch_based_on_MA_tr_loss = self.epoch
+
+            if self.best_val_eval_criterion_MA is None:
+                self.best_val_eval_criterion_MA = self.val_eval_criterion_MA
+
+            # check if the current epoch is the best one according to moving average of validation criterion. If so
+            # then save 'best' model
+            # Do not use this for validation. This is intended for test set prediction only.
+            #self.print_to_log_file("current best_val_eval_criterion_MA is %.4f0" % self.best_val_eval_criterion_MA)
+            #self.print_to_log_file("current val_eval_criterion_MA is %.4f" % self.val_eval_criterion_MA)
+
+            if self.val_eval_criterion_MA > self.best_val_eval_criterion_MA:
+                self.best_val_eval_criterion_MA = self.val_eval_criterion_MA
+                self.print_to_log_file("saving best epoch checkpoint...")
+                if self.save_best_checkpoint: self.save_checkpoint(join(self.output_folder, "model_best.model"))
+
+            # Now see if the moving average of the train loss has improved. If yes then reset patience, else
+            # increase patience
+            if self.train_loss_MA + self.train_loss_MA_eps < self.best_MA_tr_loss_for_patience:
+                self.best_MA_tr_loss_for_patience = self.train_loss_MA
+                self.best_epoch_based_on_MA_tr_loss = self.epoch
+                #self.print_to_log_file("New best epoch (train loss MA): %03.4f" % self.best_MA_tr_loss_for_patience)
+            else:
+                pass
+                #self.print_to_log_file("No improvement: current train MA %03.4f, best: %03.4f, eps is %03.4f" %
+                #                       (self.train_loss_MA, self.best_MA_tr_loss_for_patience, self.train_loss_MA_eps))
+
+            # if patience has reached its maximum then finish training (provided lr is low enough)
+            if self.epoch - self.best_epoch_based_on_MA_tr_loss > self.patience:
+                if self.optimizer.param_groups[0]['lr'] > self.lr_threshold:
+                    #self.print_to_log_file("My patience ended, but I believe I need more time (lr > 1e-6)")
+                    self.best_epoch_based_on_MA_tr_loss = self.epoch - self.patience // 2
+                else:
+                    #self.print_to_log_file("My patience ended")
+                    continue_training = False
+            else:
+                pass
+                #self.print_to_log_file(
+                #    "Patience: %d/%d" % (self.epoch - self.best_epoch_based_on_MA_tr_loss, self.patience))
+
+        return continue_training
 class nnUNetTrainerV2BraTSRegions(nnUNetTrainerV2):
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
                  unpack_data=True, deterministic=True, fp16=False):

@@ -15,6 +15,7 @@
 
 from _warnings import warn
 from typing import Tuple
+from copy import deepcopy
 
 import matplotlib
 from batchgenerators.utilities.file_and_folder_operations import *
@@ -40,7 +41,7 @@ from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 
 
 class NetworkTrainer(object):
-    def __init__(self, deterministic=True, fp16=False):
+    def __init__(self, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None):
         """
         A generic class that can train almost any neural network (RNNs excluded). It provides basic functionality such
         as the training loop, tracking of training and validation losses (and the target metric if you implement it)
@@ -126,6 +127,79 @@ class NetworkTrainer(object):
         self.save_best_checkpoint = True  # whether or not to save the best checkpoint according to self.best_val_eval_criterion_MA
         self.save_final_checkpoint = True  # whether or not to save the final checkpoint
 
+        ################# Weights & Biases ##################################
+        self.setup_wandb(wandb_project, wandb_entity, wandb_run_id)
+
+    def setup_wandb(self, wandb_project=None, wandb_entity=None, wandb_run_id=None):
+        # setup W&B
+        try:
+            import wandb
+            self._wandb = wandb
+            self._use_wandb = True
+
+            self.wandb_entity = wandb_entity
+            self.wandb_project = wandb_project
+            self.wandb_run_id = wandb_run_id
+
+            if self.wandb_entity is None:
+                try:
+                    self.wandb_entity = os.environ['wandb_entity']    
+                    self.print_to_log_file(f'Using wandb entity `{self.wandb_entity}` from environment variable `wandb_entity`')
+                except KeyError:
+                    pass
+
+            if self.wandb_project is None:
+                try:
+                    self.wandb_project = os.environ['wandb_project']    
+                    self.print_to_log_file(f'Using wandb project `{self.wandb_project}` from environment variable `wandb_project`')
+                except KeyError:
+                    pass
+        except ImportError as e:
+            self._use_wandb = False
+            pass  # no wandb to log stuff to :(
+
+    def maybe_initialize_wandb(self):
+        if self._use_wandb:
+            self._initialize_wandb()
+
+    def _initialize_wandb(self):
+        task = self.dataset_directory.split("/")[-1]
+
+        if self.wandb_run_id is None:
+            self._wandb.init(
+                project=self.wandb_project,
+                entity=self.wandb_entity,
+                name=f"{task}-{self.fold}"
+            )
+
+            self.wandb_run_id = self._wandb.run.id
+        else:
+            self._wandb.init(
+                project=self.wandb_project,
+                entity=self.wandb_entity,
+                id=self.wandb_run_id,
+                resume="allow",
+            )
+
+        self._wandb.watch(self.network)
+
+        if len(self._wandb.config.keys()) == 0:
+            wandb_config = deepcopy(self.plans)
+            wandb_config['fp16'] = self.fp16
+            wandb_config['deterministic'] = self.deterministic
+            wandb_config['batch_size'] = self.batch_size
+            wandb_config['task'] = task
+            wandb_config['fold'] = str(self.fold)
+
+            m = '3D' if self.threeD else '2D'
+            wandb_config['model'] = f"{m} {type(self.network).__name__}"
+            wandb_config['trainer'] = type(self).__name__
+
+            for k, v in self.data_aug_params.items():
+                wandb_config['DA__'+k] = v
+
+            self._wandb.config.update(wandb_config)
+
     @abstractmethod
     def initialize(self, training=True):
         """
@@ -189,6 +263,9 @@ class NetworkTrainer(object):
         Should probably by improved
         :return:
         """
+        if self.epoch == 0:
+            self.maybe_initialize_wandb()
+
         try:
             font = {'weight': 'normal',
                     'size': 18}
@@ -218,6 +295,16 @@ class NetworkTrainer(object):
 
             fig.savefig(join(self.output_folder, "progress.png"))
             plt.close()
+
+            # update wandb
+            if self._wandb is not None:
+                self._wandb.log({
+                    'epoch': self.epoch,
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'train_loss': self.all_tr_losses[-1],
+                    'val_loss': self.all_val_losses[-1],
+                    'eval_metric': self.all_val_eval_metrics[-1],
+                })
         except IOError:
             self.print_to_log_file("failed to plot: ", sys.exc_info())
 
@@ -280,7 +367,9 @@ class NetworkTrainer(object):
             'lr_scheduler_state_dict': lr_sched_state_dct,
             'plot_stuff': (self.all_tr_losses, self.all_val_losses, self.all_val_losses_tr_mode,
                            self.all_val_eval_metrics),
-            'best_stuff' : (self.best_epoch_based_on_MA_tr_loss, self.best_MA_tr_loss_for_patience, self.best_val_eval_criterion_MA)}
+            'best_stuff' : (self.best_epoch_based_on_MA_tr_loss, self.best_MA_tr_loss_for_patience, self.best_val_eval_criterion_MA),
+            'wandb_run_id': self.wandb_run_id
+        }
         if self.amp_grad_scaler is not None:
             save_this['amp_grad_scaler'] = self.amp_grad_scaler.state_dict()
 
@@ -319,6 +408,11 @@ class NetworkTrainer(object):
         # saved_model = torch.load(fname, map_location=torch.device('cuda', torch.cuda.current_device()))
         saved_model = torch.load(fname, map_location=torch.device('cpu'))
         self.load_checkpoint_ram(saved_model, train)
+
+        if 'wandb_run_id' in saved_model.keys():  # necessary for compatibility
+            self.wandb_run_id = saved_model['wandb_run_id']
+
+            self.maybe_initialize_wandb()
 
     @abstractmethod
     def initialize_network(self):

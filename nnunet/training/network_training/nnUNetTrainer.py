@@ -47,7 +47,7 @@ matplotlib.use("agg")
 
 class nnUNetTrainer(NetworkTrainer):
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False):
+                 unpack_data=True, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None):
         """
         :param deterministic:
         :param fold: can be either [0 ... 5) for cross-validation, 'all' to train on all available training data or
@@ -72,10 +72,10 @@ class nnUNetTrainer(NetworkTrainer):
         IMPORTANT: If you inherit from nnUNetTrainer and the init args change then you need to redefine self.init_args
         in your init accordingly. Otherwise checkpoints won't load properly!
         """
-        super(nnUNetTrainer, self).__init__(deterministic, fp16)
+        super(nnUNetTrainer, self).__init__(deterministic, fp16, wandb_project, wandb_entity, wandb_run_id)
         self.unpack_data = unpack_data
         self.init_args = (plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
-                          deterministic, fp16)
+                          deterministic, fp16, wandb_project, wandb_entity, wandb_run_id)
         # set through arguments from init
         self.stage = stage
         self.experiment_name = self.__class__.__name__

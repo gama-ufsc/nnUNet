@@ -140,20 +140,6 @@ class NetworkTrainer(object):
             self.wandb_entity = wandb_entity
             self.wandb_project = wandb_project
             self.wandb_run_id = wandb_run_id
-
-            if self.wandb_entity is None:
-                try:
-                    self.wandb_entity = os.environ['wandb_entity']    
-                    self.print_to_log_file(f'Using wandb entity `{self.wandb_entity}` from environment variable `wandb_entity`')
-                except KeyError:
-                    pass
-
-            if self.wandb_project is None:
-                try:
-                    self.wandb_project = os.environ['wandb_project']    
-                    self.print_to_log_file(f'Using wandb project `{self.wandb_project}` from environment variable `wandb_project`')
-                except KeyError:
-                    pass
         except ImportError as e:
             self._use_wandb = False
             pass  # no wandb to log stuff to :(
@@ -164,6 +150,20 @@ class NetworkTrainer(object):
 
     def _initialize_wandb(self):
         task = self.dataset_directory.split("/")[-1]
+
+        if self.wandb_entity is None:
+            try:
+                self.wandb_entity = os.environ['wandb_entity']    
+                self.print_to_log_file(f'Using wandb entity `{self.wandb_entity}` from environment variable `wandb_entity`')
+            except KeyError:
+                pass
+
+        if self.wandb_project is None:
+            try:
+                self.wandb_project = os.environ['wandb_project']    
+                self.print_to_log_file(f'Using wandb project `{self.wandb_project}` from environment variable `wandb_project`')
+            except KeyError:
+                pass
 
         if self.wandb_run_id is None:
             self._wandb.init(
@@ -471,7 +471,7 @@ class NetworkTrainer(object):
                 self.lr_scheduler.step(self.epoch)
 
         self.all_tr_losses, self.all_val_losses, self.all_val_losses_tr_mode, self.all_val_eval_metrics = checkpoint[
-            'plot_stuff']
+            'plot_stuff'][:4]
 
         # load best loss (if present)
         if 'best_stuff' in checkpoint.keys():

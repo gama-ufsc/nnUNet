@@ -13,10 +13,12 @@
 #    limitations under the License.
 
 
+from collections import OrderedDict
 from copy import deepcopy
 from multiprocessing import Queue, Process
+from re import T
 from threading import Thread
-from time import sleep
+from time import sleep, time
 from typing import Tuple, Union
 import matplotlib
 import matplotlib.pyplot as plt
@@ -50,7 +52,9 @@ import sys
 sys.path.append('/home/bruno-pacheco/brats/')
 from brats.utils import dice
 
-eval_every = 2
+eval_every = 1
+
+default_num_threads = 4
 
 
 class nnUNetTrainerV2BraTSRegions_BN(nnUNetTrainerV2):
@@ -164,6 +168,17 @@ def postprocess_softmax_return_dice(segmentation_softmax: Union[str, np.ndarray]
 
 
 class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
+    def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None, unpack_data=True, deterministic=True, fp16=False, wandb_project='brats-nnunet', wandb_entity=None, wandb_run_id=None):
+        super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data, deterministic, fp16, wandb_project, wandb_entity, wandb_run_id)
+        self.save_every = 1
+
+        # if self.threeD:
+        #     self.max_num_epochs = 500
+        # else:
+        self.max_num_epochs = 51
+
+        self.print_to_log_file(f"self.max_num_epochs: {self.max_num_epochs}")
+
     def update_eval_criterion_MA(self):
         """
         If self.all_val_eval_metrics is unused (len=0) then we fall back to using -self.all_val_losses for the MA to determine early stopping
@@ -205,6 +220,9 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
         Should probably be improved
         :return:
         """
+        if self.epoch == 0:
+            self.maybe_initialize_wandb()
+
         try:
             font = {'weight': 'normal',
                     'size': 18}
@@ -227,7 +245,17 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
             x_values_eval = list(range(0, self.epoch + 1, eval_every))
             if len(self.all_val_eval_metrics) == len(x_values_eval):
                 ax2.plot(x_values_eval, self.all_val_eval_metrics, color='g', ls='--', label="evaluation metric")
-                ax2.plot(x_values_eval, self.all_val_eval_criterion_MAs, color='g', label=f"(alpha={self.val_eval_criterion_alpha})")
+                try:
+                    ax2.plot(x_values_eval, self.all_val_eval_criterion_MAs, color='g', label=f"(alpha={self.val_eval_criterion_alpha})")
+                except:
+                    all_MAs = [self.all_val_eval_metrics[0]]
+                    for i in range(1, len(self.all_val_eval_metrics)):
+                        all_MAs.append(
+                            self.val_eval_criterion_alpha * all_MAs[i-1] +
+                            (1 - self.val_eval_criterion_alpha) * self.all_val_eval_metrics[i]
+                        )
+                    ax2.plot(x_values_eval, all_MAs, color='g', label=f"(alpha={self.val_eval_criterion_alpha})")
+                    self.all_val_eval_criterion_MAs = all_MAs
 
             ax.set_xlabel("epoch")
             ax.set_ylabel("loss")
@@ -238,6 +266,17 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
 
             fig.savefig(join(self.output_folder, "progress.png"))
             plt.close()
+
+            # update wandb
+            if self._wandb is not None:
+                self._wandb.log({
+                    'epoch': self.epoch,
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'train_loss': self.all_tr_losses[-1],
+                    'val_loss': self.all_val_losses[-1],
+                    'eval_metric': self.all_val_eval_metrics[-1],
+                    # 'eval_criterion_MA': self.all_val_eval_criterion_MAs[-1],
+                })
         except IOError:
             self.print_to_log_file("failed to plot: ", sys.exc_info())
 
@@ -261,6 +300,7 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
             use_gaussian = True
             overwrite = True
             all_in_gpu = False
+            sample_val = True
 
             ds = self.network.do_ds
             self.network.do_ds = False
@@ -411,12 +451,18 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
             pred_queue = Queue()
             scores_queue = Queue()
 
+            if sample_val:
+                self.print_to_log_file('evaluating on a sample of the validation set')
+                dataset_val_keys = np.random.choice(list(self.dataset_val.keys()), 10, replace=False)
+            else:
+                dataset_val_keys = self.dataset_val.keys()
+
             # build queue with patient ids
-            for k in self.dataset_val.keys():
+            for k in dataset_val_keys:
                 ks_queue.put(k)
             ks_queue.put(None)
 
-            n_loader_threads = 2
+            n_loader_threads = 1
             print(f'firing {n_loader_threads} loaders')
             # fire loaders
             loaders = [Thread(target=load, args=(ks_queue, data_queue))
@@ -429,7 +475,7 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
             # fire consumers
             # consumers = [Thread(target=compute_score, args=(pred_queue, scores_queue))
             consumers = [Process(target=compute_score, args=(pred_queue, scores_queue))
-                         for _ in range(default_num_threads)]
+                         for _ in range(default_num_threads - n_loader_threads - 1)]
             for consumer in consumers:
                 consumer.daemon = True
                 consumer.start()
@@ -453,6 +499,7 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
                 try:
                     psutil.Process(consumer.pid).terminate()
                 except psutil.NoSuchProcess:
+                    self.print_to_log_file("Process not found", consumer.pid)
                     pass
             # results = [i.get()[0] for i in results]
             # results = Parallel(n_jobs=default_num_threads, backend="threading")(results)
@@ -491,10 +538,11 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
             #self.print_to_log_file("current best_val_eval_criterion_MA is %.4f0" % self.best_val_eval_criterion_MA)
             #self.print_to_log_file("current val_eval_criterion_MA is %.4f" % self.val_eval_criterion_MA)
 
-            if self.val_eval_criterion_MA > self.best_val_eval_criterion_MA:
-                self.best_val_eval_criterion_MA = self.val_eval_criterion_MA
-                self.print_to_log_file("saving best epoch checkpoint...")
-                if self.save_best_checkpoint: self.save_checkpoint(join(self.output_folder, "model_best.model"))
+            if self.val_eval_criterion_MA is not None:
+                if self.val_eval_criterion_MA > self.best_val_eval_criterion_MA:
+                    self.best_val_eval_criterion_MA = self.val_eval_criterion_MA
+                    self.print_to_log_file("saving best epoch checkpoint...")
+                    if self.save_best_checkpoint: self.save_checkpoint(join(self.output_folder, "model_best.model"))
 
             # Now see if the moving average of the train loss has improved. If yes then reset patience, else
             # increase patience
@@ -521,11 +569,13 @@ class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
                 #    "Patience: %d/%d" % (self.epoch - self.best_epoch_based_on_MA_tr_loss, self.patience))
 
         return continue_training
+
+
 class nnUNetTrainerV2BraTSRegions(nnUNetTrainerV2):
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False):
+                 unpack_data=True, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
-                         deterministic, fp16)
+                         deterministic, fp16, wandb_project, wandb_entity, wandb_run_id)
         self.regions = get_brats_regions()
         self.regions_class_order = (1, 2, 3)
         self.loss = DC_and_BCE_loss({}, {'batch_dice': False, 'do_bg': True, 'smooth': 0})

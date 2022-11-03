@@ -42,13 +42,15 @@ class nnUNetTrainerV2(nnUNetTrainer):
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None):
+                 unpack_data=True, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None, use_wandb=True):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
-                         deterministic, fp16, wandb_project, wandb_entity, wandb_run_id)
+                         deterministic, fp16, wandb_project, wandb_entity, wandb_run_id, use_wandb)
         self.max_num_epochs = 200
         self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
+
+        self.save_every = 1
 
         self.pin_memory = True
 
@@ -267,7 +269,7 @@ class nnUNetTrainerV2(nnUNetTrainer):
         if run_online_evaluation:
             self.run_online_evaluation(output, target)
 
-        del target
+        del target, output
 
         return l.detach().cpu().numpy()
 
@@ -333,6 +335,9 @@ class nnUNetTrainerV2(nnUNetTrainer):
         for i in tr_keys:
             self.dataset_tr[i] = self.dataset[i]
         self.dataset_val = OrderedDict()
+        if self.fold == 'all':
+            self.print_to_log_file('WARNING: USING ONLY A COUPLE OF IMAGES FOR VALIDATION.')
+            val_keys = np.random.choice(val_keys, 2)
         for i in val_keys:
             self.dataset_val[i] = self.dataset[i]
 

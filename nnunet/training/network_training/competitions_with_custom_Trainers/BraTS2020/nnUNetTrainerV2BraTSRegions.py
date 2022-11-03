@@ -168,8 +168,8 @@ def postprocess_softmax_return_dice(segmentation_softmax: Union[str, np.ndarray]
 
 
 class nnUNetTrainerV2BraTSRegions_BN_Our(nnUNetTrainerV2BraTSRegions_BN):
-    def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None, unpack_data=True, deterministic=True, fp16=False, wandb_project='brats-nnunet', wandb_entity=None, wandb_run_id=None):
-        super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data, deterministic, fp16, wandb_project, wandb_entity, wandb_run_id)
+    def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None, unpack_data=True, deterministic=True, fp16=False, wandb_project='brats-nnunet', wandb_entity=None, wandb_run_id=None, use_wandb=True):
+        super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data, deterministic, fp16, wandb_project, wandb_entity, wandb_run_id, use_wandb)
         self.save_every = 1
 
         # if self.threeD:

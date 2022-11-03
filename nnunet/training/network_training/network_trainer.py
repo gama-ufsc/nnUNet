@@ -41,7 +41,7 @@ from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 
 
 class NetworkTrainer(object):
-    def __init__(self, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None):
+    def __init__(self, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None, use_wandb=True):
         """
         A generic class that can train almost any neural network (RNNs excluded). It provides basic functionality such
         as the training loop, tracking of training and validation losses (and the target metric if you implement it)
@@ -128,7 +128,10 @@ class NetworkTrainer(object):
         self.save_final_checkpoint = True  # whether or not to save the final checkpoint
 
         ################# Weights & Biases ##################################
-        self.setup_wandb(wandb_project, wandb_entity, wandb_run_id)
+        if use_wandb:
+            self.setup_wandb(wandb_project, wandb_entity, wandb_run_id)
+        else:
+            self._use_wandb = False
 
     def setup_wandb(self, wandb_project=None, wandb_entity=None, wandb_run_id=None):
         # setup W&B

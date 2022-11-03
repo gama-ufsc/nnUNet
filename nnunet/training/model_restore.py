@@ -54,7 +54,10 @@ def restore_model(pkl_file, checkpoint=None, train=False, fp16=None):
     :return:
     """
     info = load_pickle(pkl_file)
-    init = info['init']
+    init = list(info['init'])
+    for i in range(len(init)):
+        if isinstance(init[i], str):
+            init[i] = init[i].replace('/home/bruno-pacheco/brats-generalization', os.environ['PROJ_ROOT'])
     name = info['name']
     search_in = join(nnunet.__path__[0], "training", "network_training")
     tr = recursive_find_python_class([search_in], name, current_module="nnunet.training.network_training")
@@ -87,7 +90,7 @@ def restore_model(pkl_file, checkpoint=None, train=False, fp16=None):
 
     # ToDo Fabian make saves use kwargs, please...
 
-    trainer = tr(*init)
+    trainer = tr(*init, use_wandb=train)
 
     # We can hack fp16 overwriting into the trainer without changing the init arguments because nothing happens with
     # fp16 in the init, it just saves it to a member variable

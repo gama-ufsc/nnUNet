@@ -300,7 +300,7 @@ class NetworkTrainer(object):
             plt.close()
 
             # update wandb
-            if self._wandb is not None:
+            if self._use_wandb:
                 self._wandb.log({
                     'epoch': self.epoch,
                     'learning_rate': self.optimizer.param_groups[0]['lr'],
@@ -368,11 +368,15 @@ class NetworkTrainer(object):
             'state_dict': state_dict,
             'optimizer_state_dict': optimizer_state_dict,
             'lr_scheduler_state_dict': lr_sched_state_dct,
-            'plot_stuff': (self.all_tr_losses, self.all_val_losses, self.all_val_losses_tr_mode,
-                           self.all_val_eval_metrics),
-            'best_stuff' : (self.best_epoch_based_on_MA_tr_loss, self.best_MA_tr_loss_for_patience, self.best_val_eval_criterion_MA),
-            'wandb_run_id': self.wandb_run_id
+            'plot_stuff': (self.all_tr_losses, self.all_val_losses,
+                           self.all_val_losses_tr_mode, self.all_val_eval_metrics),
+            'best_stuff' : (self.best_epoch_based_on_MA_tr_loss,
+                            self.best_MA_tr_loss_for_patience,
+                            self.best_val_eval_criterion_MA),
         }
+        if self._use_wandb:
+            save_this['wandb_run_id'] = self.wandb_run_id
+
         if self.amp_grad_scaler is not None:
             save_this['amp_grad_scaler'] = self.amp_grad_scaler.state_dict()
 

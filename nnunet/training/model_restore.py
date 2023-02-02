@@ -55,9 +55,10 @@ def restore_model(pkl_file, checkpoint=None, train=False, fp16=None):
     """
     info = load_pickle(pkl_file)
     init = list(info['init'])
-    for i in range(len(init)):
-        if isinstance(init[i], str):
-            init[i] = init[i].replace('/home/bruno-pacheco/brats-generalization', os.environ['PROJ_ROOT'])
+    # Useful if models trained in other machines are to be loaded
+    # for i in range(len(init)):
+    #     if isinstance(init[i], str):
+    #         init[i] = init[i].replace('/home/bruno-pacheco/brats-generalization', os.environ['PROJ_ROOT'])
     name = info['name']
     search_in = join(nnunet.__path__[0], "training", "network_training")
     tr = recursive_find_python_class([search_in], name, current_module="nnunet.training.network_training")

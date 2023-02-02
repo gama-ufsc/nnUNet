@@ -23,6 +23,7 @@ from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss
 from torch import nn
 from torch.optim import SGD
 from torch.backends import cudnn
+from torchvision import models
 
 
 class ResidualUNetEncoder(nn.Module):
@@ -424,7 +425,6 @@ def find_3d_configuration():
                                                 blocks_per_stage_decoder[:len(conv_op_kernel_sizes)-1], 2, batch_size))
     # the output is 1230348800.0 for me
     # I increment that number by 1 to allow this configuration be be chosen
-
 
 def find_2d_configuration():
     # lets compute a reference for 3D

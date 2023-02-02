@@ -16,6 +16,7 @@ from typing import Tuple
 import numpy as np
 import torch
 from nnunet.network_architecture.generic_modular_residual_UNet import FabiansUNet, get_default_network_config
+from nnunet.network_architecture.generic_ResNetUNet import ResUNet, ResNetEncoder
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.training.network_training.nnUNetTrainerV2 import nnUNetTrainerV2
@@ -28,7 +29,7 @@ class nnUNetTrainerV2_ResencUNet(nnUNetTrainerV2):
             cfg = get_default_network_config(3, None, norm_type="in")
 
         else:
-            cfg = get_default_network_config(1, None, norm_type="in")
+            cfg = get_default_network_config(2, None, norm_type="in")
 
         stage_plans = self.plans['plans_per_stage'][self.stage]
         conv_kernel_sizes = stage_plans['conv_kernel_sizes']
@@ -97,3 +98,35 @@ class nnUNetTrainerV2_ResencUNet(nnUNetTrainerV2):
         ret = nnUNetTrainer.run_training(self)
         self.network.decoder.deep_supervision = ds
         return ret
+
+class nnUNetTrainerV2_ResNetUNet(nnUNetTrainerV2_ResencUNet):
+    def initialize_network(self):
+        if self.threeD:
+            cfg = get_default_network_config(3, None, norm_type="in")
+        else:
+            cfg = get_default_network_config(2, None, norm_type="in")
+
+        stage_plans = self.plans['plans_per_stage'][self.stage]
+        blocks_per_stage_decoder = stage_plans['num_blocks_decoder']
+
+        self.network = ResUNet(self.num_input_channels, cfg, self.num_classes,
+                               blocks_per_stage_decoder, deep_supervision=True,
+                               upscale_logits=False, initializer=InitWeights_He(1e-2),
+                               props_decoder=None, pretrained_resnet=False)
+
+        if torch.cuda.is_available():
+            self.network.cuda()
+        self.network.inference_apply_nonlin = softmax_helper
+
+    def setup_DA_params(self):
+        """
+        net_num_pool_op_kernel_sizes is different in resunet
+        """
+        super().setup_DA_params()
+
+        pool_kernel_sizes = np.array(ResNetEncoder.stage_pool_kernel_size)
+        ds_scales = [pool_kernel_sizes[0],]
+        for i in range(1,len(pool_kernel_sizes)):
+            ds_scales.append(ds_scales[-1] / pool_kernel_sizes[i])
+
+        self.deep_supervision_scales = [list(s) for s in ds_scales]

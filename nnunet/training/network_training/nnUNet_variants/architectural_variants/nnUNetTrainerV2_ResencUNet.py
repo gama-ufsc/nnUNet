@@ -100,6 +100,13 @@ class nnUNetTrainerV2_ResencUNet(nnUNetTrainerV2):
         return ret
 
 class nnUNetTrainerV2_ResNetUNet(nnUNetTrainerV2_ResencUNet):
+    def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
+                 unpack_data=True, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None, use_wandb=True, pretrained_resnet=False):
+        super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage,
+                 unpack_data, deterministic, fp16, wandb_project, wandb_entity, wandb_run_id, use_wandb)
+        self.max_num_epochs = 50
+        self.pretrained_resnet = pretrained_resnet
+
     def initialize_network(self):
         if self.threeD:
             cfg = get_default_network_config(3, None, norm_type="in")
@@ -112,7 +119,7 @@ class nnUNetTrainerV2_ResNetUNet(nnUNetTrainerV2_ResencUNet):
         self.network = ResUNet(self.num_input_channels, cfg, self.num_classes,
                                blocks_per_stage_decoder, deep_supervision=True,
                                upscale_logits=False, initializer=InitWeights_He(1e-2),
-                               props_decoder=None, pretrained_resnet=False)
+                               props_decoder=None, pretrained_resnet=self.pretrained_resnet)
 
         if torch.cuda.is_available():
             self.network.cuda()

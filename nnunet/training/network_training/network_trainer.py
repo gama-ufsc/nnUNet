@@ -16,6 +16,7 @@
 from _warnings import warn
 from typing import Tuple
 from copy import deepcopy
+from shutil import copyfile
 
 import matplotlib
 from batchgenerators.utilities.file_and_folder_operations import *
@@ -169,6 +170,7 @@ class NetworkTrainer(object):
                 pass
 
         if self.wandb_run_id is None:
+#             print('ADDING "pretrained" TO RUN NAME @ wandb')
             self._wandb.init(
                 project=self.wandb_project,
                 entity=self.wandb_entity,
@@ -191,6 +193,7 @@ class NetworkTrainer(object):
             wandb_config['fp16'] = self.fp16
             wandb_config['deterministic'] = self.deterministic
             wandb_config['batch_size'] = self.batch_size
+            wandb_config['max_num_epochs'] = self.max_num_epochs
             wandb_config['task'] = task
             wandb_config['fold'] = str(self.fold)
 
@@ -381,6 +384,17 @@ class NetworkTrainer(object):
             save_this['amp_grad_scaler'] = self.amp_grad_scaler.state_dict()
 
         torch.save(save_this, fname)
+        
+        if self._use_wandb:
+            copyfile(fname, os.path.join(self._wandb.run.dir, os.path.basename(fname)))
+            self._wandb.save(os.path.basename(fname))
+            
+            try:
+                copyfile(fname+'.pkl', os.path.join(self._wandb.run.dir, os.path.basename(fname))+'.pkl')
+                self._wandb.save(os.path.basename(fname)+'.pkl')
+            except FileNotFoundError:
+                self.print_to_log_file("No "+os.path.basename(fname)+".pkl found")
+
         self.print_to_log_file("done, saving took %.2f seconds" % (time() - start_time))
 
     def load_best_checkpoint(self, train=True):

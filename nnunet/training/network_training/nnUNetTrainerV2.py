@@ -45,7 +45,7 @@ class nnUNetTrainerV2(nnUNetTrainer):
                  unpack_data=True, deterministic=True, fp16=False, wandb_project=None, wandb_entity=None, wandb_run_id=None, use_wandb=True):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16, wandb_project, wandb_entity, wandb_run_id, use_wandb)
-        self.max_num_epochs = 200
+        self.max_num_epochs = 30
         self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None

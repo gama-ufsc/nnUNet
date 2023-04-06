@@ -50,6 +50,7 @@ class ResNetEncoder(nn.Module):
         """
         super(ResNetEncoder, self).__init__()
 
+#         print('USING ResNet50 WEIGHTS FROM ImageNet')
         resnet = models.resnet50(pretrained=pretrained)
 
         self.channel_adapter = nn.Conv2d(input_channels, resnet.conv1.in_channels, [1,1])
@@ -75,13 +76,13 @@ class ResNetEncoder(nn.Module):
         """
         skips = []
 
-        for s in self.stages:
-            x = s(x)
-            if self.default_return_skips:
-                skips.append(x)
-
         if return_skips is None:
             return_skips = self.default_return_skips
+
+        for s in self.stages:
+            x = s(x)
+            if return_skips:
+                skips.append(x)
 
         if return_skips:
             return skips
@@ -131,6 +132,7 @@ class ResUNet(SegmentationNetwork):
         self.decoder = PlainConvUNetDecoder(self.encoder, num_classes, num_blocks_per_stage_decoder, props_decoder,
                                             deep_supervision, upscale_logits)
         if initializer is not None:
+#             print('IGNORING INITIALIZER')
             self.apply(initializer)
 
     def forward(self, x):
